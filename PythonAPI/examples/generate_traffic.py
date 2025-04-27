@@ -206,6 +206,7 @@ def main():
 
         spawn_points = world.get_map().get_spawn_points()
         number_of_spawn_points = len(spawn_points)
+        print(f"(wen) There are {number_of_spawn_points} spawn points:")
 
         if args.number_of_vehicles < number_of_spawn_points:
             random.shuffle(spawn_points)

@@ -1,0 +1,48 @@
+=== 相機外部參數（Extrinsic） ===
+Location: x=2.4950, y=0.0000, z=1.7149
+Rotation: pitch=0.0000, yaw=0.0000, roll=0.0000
+
+=== 相機內部參數（Intrinsic / Blueprint 設定） ===
+chromatic_aberration_intensity: 0.0
+tint: 0.0
+shoulder: 0.25999999046325684
+toe: 0.550000011920929
+white_clip: 0.03999999910593033
+slope: 0.8799999952316284
+blur_radius: 0.0
+blur_amount: 1.0
+blade_count: 5
+exposure_speed_down: 1.0
+min_fstop: 1.2000000476837158
+exposure_speed_up: 3.0
+exposure_max_bright: 12.0
+motion_blur_min_object_screen_size: 0.10000000149011612
+bloom_intensity: 0.675000011920929
+lens_flare_intensity: 0.10000000149011612
+black_clip: 0.0
+motion_blur_max_distortion: 0.3499999940395355
+focal_distance: 1000.0
+motion_blur_intensity: 0.44999998807907104
+temp: 6500.0
+gamma: 2.200000047683716
+enable_postprocess_effects: True
+iso: 100.0
+shutter_speed: 200.0
+exposure_compensation: 0.0
+exposure_mode: ActorAttribute(id=exposure_mode,type=str,value=histogram)
+calibration_constant: 16.0
+lens_y_size: 0.07999999821186066
+lens_x_size: 0.07999999821186066
+lens_kcube: 0.0
+lens_k: -1.0
+lens_circle_multiplier: 0.0
+fstop: 1.399999976158142
+fov: 90.0
+image_size_y: 720
+chromatic_aberration_offset: 0.0
+lens_circle_falloff: 5.0
+image_size_x: 1280
+sensor_tick: 0.0
+ros_name: ActorAttribute(id=ros_name,type=str,value=sensor.camera.rgb)
+exposure_min_bright: 10.0
+role_name: ActorAttribute(id=role_name,type=str,value=front)

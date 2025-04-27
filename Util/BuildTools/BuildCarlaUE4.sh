@@ -128,7 +128,8 @@ if ${REMOVE_INTERMEDIATE} ; then
 
   rm -Rf ${UE4_INTERMEDIATE_FOLDERS}
 
-  cd Plugins
+  #cd Plugins
+  cd /home/rvl/UnrealEngine_4.26/Engine/Plugins # wen edited 2025/02/04
   rm -Rf HoudiniEngine
   cd ..
 

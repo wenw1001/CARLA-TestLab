@@ -1,3 +1,10 @@
+"""
+This script is used for autocontrol the vehicle.
+You have two options to switch between recording/replay mode.
+If you want to record the path you are driving, set --agents to True.
+If you want to replay the path, set --agents to False and --replay to True.
+"""
+
 # ==============================================================================
 # -- find carla module ---------------------------------------------------------
 # ==============================================================================
@@ -29,12 +36,14 @@ sys.path.append('../carla')
 
 from agents.navigation.behavior_agent import BehaviorAgent
 
-def record_path(vehicle, filename="Recording/recorded_path_all5.csv"):
+def record_path(vehicle, filename=""):
     """ 記錄車輛的行駛位置點到 CSV """
+    if not filename:
+        print("error: 請輸入儲存路徑 (--save-path)")
+        return
     with open(filename, mode="w", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(["x", "y", "z", "pitch", "yaw", "roll"])  # 寫入標題
-        # writer.writerow(["x", "y", "z", "yaw"])  # 寫入標題
 
         while True:
             transform = vehicle.get_transform()
@@ -43,15 +52,14 @@ def record_path(vehicle, filename="Recording/recorded_path_all5.csv"):
             yaw = transform.rotation.yaw  # 取得車輛的偏航角
             
             writer.writerow([location.x, location.y, location.z, rotation.pitch, rotation.yaw, rotation.roll])  # 記錄座標與偏航角
-            # writer.writerow([location.x, location.y, location.z, rotation.yaw])  # 記錄座標與偏航角
             print(f"Recorded: x={location.x}, y={location.y}, z={location.z}, pitch={rotation.pitch}, yaw={rotation.yaw}, roll={rotation.roll}")  # 顯示目前位置
 
             time.sleep(0.5)  # 每 0.5 秒記錄一次位置
             
-            # 檢查車輛是否到達終點
-            if agent.done():
-                print("目的地已到達！")
-                break
+            # # 檢查車輛是否到達終點
+            # if agent.done():
+            #     print("目的地已到達！")
+            #     break
 
 def load_path(filename=None):
     """ 讀取記錄的路徑點 """
@@ -105,23 +113,27 @@ def main(args):
 
     if args.agents == True:
         print("Mode: agents mode")
-        # 設定行為代理人
-        global agent  # 讓 agent 可被 record_path() 使用
-        agent = BehaviorAgent(ego_vehicle, behavior="normal")  # "normal"、"aggressive"、"cautious"
+
+        ###### 這段目前有問題，無法成功運作 ######
+        # # 設定行為代理人
+        # global agent  # 讓 agent 可被 record_path() 使用
+        # agent = BehaviorAgent(ego_vehicle, behavior="normal")  # "normal"、"aggressive"、"cautious"
         
-        # 設定目標位置
-        # spawn_points = self.map.get_spawn_points()
-        # destination = spawn_points[20].location  # 目標位置
-        x = 284
-        y = -145
-        z = 1
-        destination = carla.Transform(carla.Location(x=x,y=y, z=z), carla.Rotation(yaw=180)).location # 目標位置
-        agent.set_destination(destination)
+        # # 設定目標位置
+        # # spawn_points = self.map.get_spawn_points()
+        # # destination = spawn_points[20].location  # 目標位置
+        # x = 284
+        # y = -145
+        # z = 1
+        # destination = carla.Transform(carla.Location(x=x,y=y, z=z), carla.Rotation(yaw=180)).location # 目標位置
+        # agent.set_destination(destination)
+        ######################################
 
         # 啟動記錄線程
         print("start recording path")
         # print("Agent 的路徑長度:", len(agent._local_planner.waypoints_queue))
-        record_path(ego_vehicle)
+        recodring_path = args.recordingPath
+        record_path(ego_vehicle, recodring_path)
 
     elif args.replay == True:
         print("Mode: replay mode")
@@ -129,10 +141,10 @@ def main(args):
         # vehicle.set_autopilot(True)  # 讓 CARLA 內建的 AI 控制車輛
 
         # 讀取記錄的路徑
-        map_path = "Recording/recorded_path_all2.csv"
+        # map_path = "Recording/recorded_path_all2.csv"
+        map_path = args.replayPath
         print(f"using path: {map_path}")
         waypoints = load_path(map_path)
-
 
         # 讓車輛重現行駛路徑
         replay_path(ego_vehicle, waypoints)
@@ -152,5 +164,16 @@ if __name__ == '__main__':
         action='store_true',
         default=True,
         help='replay and move vehicle')
+    argparser.add_argument(
+    '--recordingPath',
+    type=str,
+    default='Recording/recorded_path_all5.csv',  # 可以自己設一個預設儲存路徑
+    help='path to save recording path')
+    argparser.add_argument(
+    '--replayPath',
+    type=str,
+    default='Recording/recorded_path_all2.csv',  # 可以自己設一個預設儲存路徑
+    help='path to load replay path')
+
     args = argparser.parse_args()
     main(args)

@@ -93,6 +93,11 @@ import math
 import random
 import re
 import weakref
+import cv2
+import time
+import threading
+import queue
+from concurrent.futures import ThreadPoolExecutor
 
 from pathlib import Path
 from utilsWen.general import increment_path
@@ -147,6 +152,11 @@ try:
 except ImportError:
     raise RuntimeError('cannot import numpy, make sure numpy package is installed')
 
+VIEW_WIDTH = 1280 # 1920//2
+VIEW_HEIGHT = 720 # 1080//2
+VIEW_FOV = 90
+
+BB_COLOR = (248, 64, 24)
 
 # ==============================================================================
 # -- Global functions ----------------------------------------------------------
@@ -318,7 +328,7 @@ class World(object):
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
         self.gnss_sensor = GnssSensor(self.player)
         self.imu_sensor = IMUSensor(self.player)
-        self.camera_manager = CameraManager(self.player,self.gnss_sensor, self.hud, self._gamma)
+        self.camera_manager = CameraManager(self.player, self.gnss_sensor, self.hud, self._gamma)
         self.camera_manager.transform_index = cam_pos_index
         self.camera_manager.set_sensor(cam_index, notify=False)
         self.camera_manager.get_camera_params()
@@ -695,6 +705,8 @@ class KeyboardControl(object):
 
 class HUD(object):
     def __init__(self, width, height):
+        print(f"VIEW_WIDTH = {width}")
+        print(f"VIEW_HEIGHT = {height}")
         self.dim = (width, height)
         font = pygame.font.Font(pygame.font.get_default_font(), 20)
         font_name = 'courier' if os.name == 'nt' else 'mono'
@@ -1008,9 +1020,7 @@ class GnssSensor(object):
     #     return gnss_data
 
 # ==============================================================================
-# -- IMUSensor -----------------------------------------------------------------
-# ==============================================================================
-
+# -- IMUSensor -----------//2
 
 class IMUSensor(object):
     def __init__(self, parent_actor):
@@ -1126,6 +1136,11 @@ class CameraManager(object):
         self.gnss_sensor = gnss_sensor
         self.hud = hud
         self.recording = False
+        self._last_location = None
+        self.K = self.get_camera_intrinsic(hud.dim[0], hud.dim[1])
+        self.image_queue = queue.Queue() # 沒用到
+        self.executor = ThreadPoolExecutor(max_workers=4)  # 可依處理需求調整
+        self.write_lock = threading.Lock()  # 新增一把鎖
         bound_x = 0.5 + self._parent.bounding_box.extent.x
         bound_y = 0.5 + self._parent.bounding_box.extent.y
         bound_z = 0.5 + self._parent.bounding_box.extent.z
@@ -1210,6 +1225,12 @@ class CameraManager(object):
             # circular reference.
             weak_self = weakref.ref(self)
             self.sensor.listen(lambda image: CameraManager._parse_image(weak_self, image))
+
+            calibration = np.identity(3)
+            calibration[0, 2] = self.hud.dim[0] / 2.0
+            calibration[1, 2] = self.hud.dim[1] / 2.0
+            calibration[0, 0] = calibration[1, 1] = self.hud.dim[0] / (2.0 * np.tan(VIEW_FOV * np.pi / 360.0))
+            self.sensor.calibration = calibration
         if notify:
             self.hud.notification(self.sensors[index][2])
         self.index = index
@@ -1223,17 +1244,39 @@ class CameraManager(object):
             global save_path
             save_path = increment_path('Recording','Recording_')
             print(f"save path: {save_path}")
+        else:
+            # global save_path
+            print(f"結束錄影，影像存於: {save_path}")
         self.hud.notification('Recording %s' % ('On' if self.recording else 'Off'))
 
     def render(self, display):
         if self.surface is not None:
             display.blit(self.surface, (0, 0))
-
+        
     @staticmethod
     def _parse_image(weak_self, image):
         self = weak_self()
         if not self:
             return
+
+        # 取得當前車輛位置
+        start_time = time.time()  # 開始計時
+        current_location = self._parent.get_transform().location
+
+        # 如果前一次位置存在，且差距很小（例如小於 0.1 公尺），就跳過這張影像
+        if self._last_location is not None:
+            dx = current_location.x - self._last_location.x
+            dy = current_location.y - self._last_location.y
+            dz = current_location.z - self._last_location.z
+            dist_sq = dx*dx + dy*dy + dz*dz
+            if dist_sq < 0.01:  # 代表幾乎沒移動
+                # print("車輛沒移動")
+                return
+
+        # 更新位置記錄
+        self._last_location = current_location
+        # print("更新位置")
+
         # print(f"self.sensors: {self.sensors}")
         if self.sensors[self.index][0].startswith('sensor.lidar'): # 處理 LIDAR 數據
             points = np.frombuffer(image.raw_data, dtype=np.dtype('f4'))
@@ -1271,116 +1314,205 @@ class CameraManager(object):
             array = array[:, :, :3]
             array = array[:, :, ::-1]
             self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+        # 結束計時（計算車輛移動）
+        end_time = time.time()
+        duration = end_time - start_time
+        # print(f"處理基本影像費時：{duration:.10f} 秒")
         if self.recording:
-            # 🚗 嘗試獲取 world
-            try:
-                world = self._parent.get_world()  # 確保 _parent 存在
-            except AttributeError:
-                print("----- get_world() error -----")
-                world = image.actor.get_world()  # 從影像物件獲取世界
+            # self.image_queue.put(image)
+            self.executor.submit(self.save_vehicle_info, image)
+            # t = threading.Thread(target=self.save_vehicle_info()) # 建立新的執行緒
+            # t.start() # 啟用執行緒
 
-            # 📌 獲取當前車輛位置
-            ego_vehicle = None
-            all_vehicles = world.get_actors().filter('vehicle.*') # 獲取所有車輛
+    def save_vehicle_info(self, image): #　self._parent，　self.gnss_sensor，　all_vehicles，　self.sensor
+        start_time = time.time()  # 開始計時
+        img = np.reshape(np.copy(image.raw_data), (image.height, image.width, 4))
+         # 🚗 嘗試獲取 world
+        try:
+            world = self._parent.get_world()  # 確保 _parent 存在
+        except AttributeError:
+            print("----- get_world() error -----")
+            world = image.actor.get_world()  # 從影像物件獲取世界
 
-            for vehicle in all_vehicles:
-                if vehicle.attributes.get('role_name') == 'hero':  # 預設玩家車輛名稱
-                    ego_vehicle = vehicle
-                    break
-            vehicle_transform = ego_vehicle.get_transform()  # 位置與旋轉
-            vehicle_location = vehicle_transform.location  # 取得座標
-            vehicle_rotation = vehicle_transform.rotation # 取得旋轉
-            vehicle_velocity = ego_vehicle.get_velocity()  # 取得速度向量
-            speed = (3.6 * (vehicle_velocity.x**2 + vehicle_velocity.y**2 + vehicle_velocity.z**2) ** 0.5)  # 轉換為 km/h
+        # ✅ 使用 snapshot 來對齊影像時間點
+        snapshot = world.get_snapshot()
 
-            # 🚗 取得 GNSS 資訊（如果有 GNSS Sensor）
-            # gnss_sensor = None
-            # for sensor in world.get_actors().filter('sensor.other.gnss'):
-            #     if sensor.parent.id == ego_vehicle.id:  # 確保是掛在 hero 車輛上的 GNSS
-            #         gnss_sensor = sensor
-            #         break
+        if snapshot.frame != image.frame:
+            print(f"[⚠️警告] Snapshot 與影像 frame 不一致: snapshot={snapshot.frame}, image={image.frame}")
 
-            # gnss_data = getattr(ego_vehicle, "gnss_sensor", None)
-            # print(f"gnss_sensor: {self.gnss_sensor}")
-            if self.gnss_sensor:
-                # gnss_data = self.gnss_sensor.get_gnss_data()
-                gnss_location = {"latitude": self.gnss_sensor.lat, "longitude": self.gnss_sensor.lon} # json
-            else:
-                gnss_location = None 
+        # 📌 獲取當前車輛位置
+        ego_vehicle = None
+        all_vehicles = world.get_actors().filter('vehicle.*') # 獲取所有車輛
 
-            # 📌 記錄附近車輛資訊
-            ego_location = ego_vehicle.get_location()
-            ego_forward_vector = ego_vehicle.get_transform().get_forward_vector()  # 自車前向量
-            nearby_vehicles = []  # 存儲附近車輛資料
-            for vehicle in all_vehicles:
-                if vehicle.id == ego_vehicle.id:
-                    continue  # 跳過自己
-                distance = ego_location.distance(vehicle.get_location())
-                # vehicle_transform = vehicle.get_transform()
-                vehicle_location = vehicle.get_location()
-                if distance < 100.0:  # 只記錄 100 公尺內的車輛
-                    # 計算相對位置向量
-                    relative_vector = carla.Vector3D(
-                        vehicle_location.x - ego_location.x,
-                        vehicle_location.y - ego_location.y,
-                        vehicle_location.z - ego_location.z
-                    )
-                    
-                    # 計算內積
-                    dot_product = (
-                        relative_vector.x * ego_forward_vector.x +
-                        relative_vector.y * ego_forward_vector.y +
-                        relative_vector.z * ego_forward_vector.z
-                    )
+        for vehicle in all_vehicles:
+            if vehicle.attributes.get('role_name') == 'hero':  # 預設玩家車輛名稱
+                ego_vehicle = vehicle
+                break
+        # ego_vehicle = self._parent
+        vehicle_transform = ego_vehicle.get_transform()  # 位置與旋轉
+        vehicle_location = vehicle_transform.location  # 取得座標
+        vehicle_rotation = vehicle_transform.rotation # 取得旋轉
+        vehicle_velocity = ego_vehicle.get_velocity()  # 取得速度向量
+        speed = (3.6 * (vehicle_velocity.x**2 + vehicle_velocity.y**2 + vehicle_velocity.z**2) ** 0.5)  # 轉換為 km/h
 
-                    # 計算向量長度（歐幾里得範數）
-                    magnitude_ego = math.sqrt(ego_forward_vector.x**2 + ego_forward_vector.y**2 + ego_forward_vector.z**2)
-                    magnitude_relative = math.sqrt(relative_vector.x**2 + relative_vector.y**2 + relative_vector.z**2)
+        # 🚗 取得 GNSS 資訊（如果有 GNSS Sensor）
+        if self.gnss_sensor:
+            # gnss_data = self.gnss_sensor.get_gnss_data()
+            gnss_location = {"latitude": self.gnss_sensor.lat, "longitude": self.gnss_sensor.lon} # json
+        else:
+            gnss_location = None 
 
-                    # 避免除以零
-                    if magnitude_ego > 0 and magnitude_relative > 0:
-                        # 計算夾角（弧度轉角度）
-                        angle_rad = math.acos(dot_product / (magnitude_ego * magnitude_relative))
-                        angle_deg = math.degrees(angle_rad)  # 轉換為度數
-                    else:
-                        angle_deg = 0.0  # 若向量長度為零，則角度設為 0
-
-                    # print(f"id:{vehicle.id}, dot={round(dot_product,6)}, degree={round(angle_deg,4)}")
-
-                    if angle_deg < 40:  # 只記錄前方的車輛(view of the camera is 40 degree)
-                        nearby_vehicles.append({
-                            "id": vehicle.id,
-                            "location": {"x": vehicle_location.x, "y": vehicle_location.y, "z": vehicle_location.z},
-                            "distance_m": round(distance, 6),
-                            "angle": round(angle_deg, 4)
-                        })
-
-
-                    # nearby_vehicles.append({
-                    # "id": vehicle.id,
-                    # "location": {"x": vehicle_transform.location.x, "y": vehicle_transform.location.y, "z": vehicle_transform.location.z},
-                    # "distance_m": round(distance, 4)
-                    # })
+        # 📌 記錄附近車輛資訊
+        ego_location = ego_vehicle.get_location()
+        ego_forward_vector = ego_vehicle.get_transform().get_forward_vector()  # 自車前向量
+        nearby_vehicles = []  # 存儲附近車輛資料
+        bounding_boxes = []
+        world_2_camera = np.array(self._camera_transforms[self.index][0].get_inverse_matrix())
+        all_vehicles_start_time = time.time()  # 開始計時
+        for vehicle in all_vehicles:
+            if vehicle.id == ego_vehicle.id:
+                continue  # 跳過自己
+            distance = ego_location.distance(vehicle.get_location())
+            vehicle_location = vehicle.get_location()
+            if distance < 100.0:  # 只記錄 100 公尺內的車輛
+                angle_deg_start_time = time.time()  # 開始計時
+                # 計算相對位置向量
+                relative_vector = carla.Vector3D(
+                    vehicle_location.x - ego_location.x,
+                    vehicle_location.y - ego_location.y,
+                    vehicle_location.z - ego_location.z
+                )
                 
-            # 🚗 設定影像名稱
-            global save_path
-            image_filename = f"{image.frame:08d}.png"
-            json_file = save_path + "/vehicle_data.json"
+                # 計算內積
+                dot_product = (
+                    relative_vector.x * ego_forward_vector.x +
+                    relative_vector.y * ego_forward_vector.y +
+                    relative_vector.z * ego_forward_vector.z
+                )
 
-            # 🚗 建立 JSON 資料結構
-            data = {
-                "frame": image.frame,
-                "image_file": image_filename,
-                # "speed_kmh": round(speed, 2),
-                "location": {"x": vehicle_location.x, "y": vehicle_location.y, "z": vehicle_location.z},
-                "rotation": {"pitch": vehicle_rotation.pitch, "yaw": vehicle_rotation.yaw, "roll": vehicle_rotation.roll},
-                "gnss": gnss_location,
-                "nearby_vehicles": nearby_vehicles
-            }
+                # 計算向量長度（歐幾里得範數）
+                magnitude_ego = math.sqrt(ego_forward_vector.x**2 + ego_forward_vector.y**2 + ego_forward_vector.z**2)
+                magnitude_relative = math.sqrt(relative_vector.x**2 + relative_vector.y**2 + relative_vector.z**2)
 
-            image.save_to_disk(save_path+f"/{image.frame:08d}.png") # 將影像保存到磁碟中
-            print(f"image saved at: {save_path+f'/{image.frame:08d}.png'}")
-            
+                # 避免除以零
+                if magnitude_ego > 0 and magnitude_relative > 0:
+                    # 計算夾角（弧度轉角度）
+                    angle_rad = math.acos(dot_product / (magnitude_ego * magnitude_relative))
+                    angle_deg = math.degrees(angle_rad)  # 轉換為度數
+                else:
+                    angle_deg = 0.0  # 若向量長度為零，則角度設為 0
+                
+                # 結束計時
+                end_time = time.time()
+                duration = end_time - angle_deg_start_time
+                print(f" 角度計算 {duration:.5f} 秒/車")
+
+                # print(f"id:{vehicle.id}, dot={round(dot_product,6)}, degree={round(angle_deg,4)}")
+                if angle_deg < 40:
+                    ############## 3D BBOX #################
+                    _3dbbox_start_time = time.time()  # 開始計時
+                    bbox = self._create_bb_points(vehicle)
+                    cords_x_y_z = self._vehicle_to_sensor(self, bbox, vehicle, self.sensor)[:3, :]
+                    cords_y_minus_z_x = np.concatenate([cords_x_y_z[1, :], -cords_x_y_z[2, :], cords_x_y_z[0, :]])
+                    bbox = np.transpose(np.dot(self.sensor.calibration, cords_y_minus_z_x))
+                    camera_bbox = np.concatenate([bbox[:, 0] / bbox[:, 2], bbox[:, 1] / bbox[:, 2], bbox[:, 2]], axis=1)
+                    bounding_boxes.append(camera_bbox)
+                    # 結束計時
+                    end_time = time.time()
+                    duration = end_time - _3dbbox_start_time
+                    print(f" 3D BBOX {duration:.5f} 秒/車")
+                    
+                    ############## 2D BBOX #################
+                    _2dbbox_start_time = time.time()  # 開始計時
+                    bb = vehicle.bounding_box
+                    
+                    # forward_vec = vehicle.get_transform().get_forward_vector()
+                    # ray = vehicle.get_transform().location - vehicle.get_transform().location
+
+                    # if forward_vec.dot(ray) > 0:
+                    if angle_deg < 40:
+                        x_max = -10000
+                        x_min = 10000
+                        y_max = -10000
+                        y_min = 10000
+                        p1 = self.get_image_point(bb.location, self.K, world_2_camera)
+                        verts = [v for v in bb.get_world_vertices(vehicle.get_transform())]
+                        # print(f"verts:{verts}")
+                        for v_idx, vert in enumerate(verts):
+                            p = self.get_image_point(vert, self.K, world_2_camera)
+                            # print(f"vert[{v_idx}]:{p}")
+                            # Find the rightmost vertex
+                            if p[0] > x_max:
+                                x_max = p[0]
+                            # Find the leftmost vertex
+                            if p[0] < x_min:
+                                x_min = p[0]
+                            # Find the highest vertex
+                            if p[1] > y_max:
+                                y_max = p[1]
+                            # Find the lowest  vertex
+                            if p[1] < y_min:
+                                y_min = p[1]
+                        # cv2.line(img, (int(x_min),int(y_min)), (int(x_max),int(y_min)), (0,0,255, 255), 1)
+                        # cv2.line(img, (int(x_min),int(y_max)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
+                        # cv2.line(img, (int(x_min),int(y_min)), (int(x_min),int(y_max)), (0,0,255, 255), 1)
+                        # cv2.line(img, (int(x_max),int(y_min)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
+                        
+                        # print(f"2Dbbox: {(x_min, y_min, x_max, y_max)}")
+                        # print("="*40)
+                            
+                    # 結束計時
+                    end_time = time.time()
+                    duration = end_time - _2dbbox_start_time
+                    print(f" 2D BBOX {duration:.5f} 秒/車")
+                    ############################################
+                    ############## kitti label #################
+                    kitti_start_time = time.time()  # 開始計時
+                    label = self.get_simple_kitti_label(self, vehicle, self.sensor)
+                    end_time = time.time()
+                    duration = end_time - kitti_start_time
+                    print(f" kitti label {duration:.5f} 秒/車")
+                    ############################################
+
+                    nearby_vehicles.append({
+                        "id": vehicle.id,
+                        "location": {"x": vehicle_location.x, "y": vehicle_location.y, "z": vehicle_location.z},
+                        "distance_m": round(distance, 6),
+                        "angle": round(angle_deg, 4), 
+                        "3Dbbox": camera_bbox.tolist(),
+                        "2Dbbox": (x_min, y_min, x_max, y_max),
+                        "label": label
+                    })
+        # 結束計時
+        end_time = time.time()
+        duration = end_time - all_vehicles_start_time
+        print(f" 計算所有車輛共花費 {duration:.5f} 秒")
+        # self.draw_bounding_boxes(bounding_boxes)    
+        # 🚗 設定影像名稱
+        global save_path
+        image_filename = f"{image.frame:08d}.png"
+        json_file = save_path + "/vehicle_data.json"
+
+        # 🚗 建立 JSON 資料結構
+        data = {
+            "frame": image.frame,
+            "image_file": image_filename,
+            # "speed_kmh": round(speed, 2),
+            "location": {"x": vehicle_location.x, "y": vehicle_location.y, "z": vehicle_location.z},
+            "rotation": {"pitch": vehicle_rotation.pitch, "yaw": vehicle_rotation.yaw, "roll": vehicle_rotation.roll},
+            "gnss": gnss_location,
+            "nearby_vehicles": nearby_vehicles
+        }
+
+        image.save_to_disk(save_path+f"/{image.frame:08d}.png") # 將影像保存到磁碟中
+        # img.save_to_disk(save_path+f"/{image.frame:08d}.png")
+        print(f"image saved at: {save_path+f'/{image.frame:08d}.png'}",end="")
+        # 結束計時
+        end_time = time.time()
+        duration = end_time - start_time
+        print(f" 資料處理 {duration:.3f} 秒")
+        
+        with self.write_lock: # 使用鎖，避免多執行緒同時讀寫
             # 🚗 讀取舊的 JSON 資料（如果檔案存在）
             if os.path.exists(json_file):
                 with open(json_file, "r") as f:
@@ -1395,8 +1527,256 @@ class CameraManager(object):
             all_data.append(data)
 
             # 🚗 儲存到 JSON 檔案
+            # json_file = save_path + f"/{image.frame:08d}.json"
             with open(json_file, "w") as f:
                 json.dump(all_data, f, indent=4)
+                print(f"(json done: {image.frame:08d})",end="")
+            # 結束計時
+            end_time = time.time()
+            duration = end_time - start_time
+            print(f" 一張影像共費時 {duration:.3f} 秒")
+
+            
+
+    @staticmethod
+    def get_image_point(loc, K, w2c):
+        # Calculate 2D projection of 3D coordinate
+
+        # Format the input coordinate (loc is a carla.Position object)
+        point = np.array([loc.x, loc.y, loc.z, 1])
+        # transform to camera coordinates
+        point_camera = np.dot(w2c, point)
+
+        # New we must change from UE4's coordinate system to an "standard"
+        # (x, y ,z) -> (y, -z, x)
+        # and we remove the fourth componebonent also
+        point_camera = [point_camera[1], -point_camera[2], point_camera[0]]
+
+        # now project 3D->2D using the camera matrix
+        point_img = np.dot(K, point_camera)
+        # normalize
+        point_img[0] /= point_img[2]
+        point_img[1] /= point_img[2]
+
+        return point_img[0:2]
+
+    def world_to_pixel(self, location):
+        """
+        世界座標轉成像素座標
+        """
+        # transform = self.camera_sensor.get_transform()
+        transform, tt1 = self._camera_transforms[1] # 往前看的車內攝像頭
+        world_2_camera = np.linalg.inv(self.carla_transform_to_matrix(transform))
+
+        point = np.array([location.x, location.y, location.z, 1])
+        camera_coords = world_2_camera.dot(point)
+
+        if camera_coords[2] <= 0:
+            return None
+
+        pixel_coords = self.K.dot(camera_coords[:3])
+        pixel_coords /= pixel_coords[2]
+
+        x = int(pixel_coords[0])
+        y = int(pixel_coords[1])
+        print(f"像素座標: ({x},{y})")
+        if 0 <= x < self.hud.dim[0] and 0 <= y < self.hud.dim[1]:
+            return (x, y)
+        else:
+            print("座標不合理")
+            return None
+
+    def carla_transform_to_matrix(self, transform):
+        """
+        將CARLA的Transform轉成4x4變換矩陣
+        """
+        # print(f"====== transform =======")
+        # print(f"{transform}")
+        # rotation = transform.rotation
+        # location = transform.location
+
+        # c_y = np.cos(np.radians(rotation.yaw))
+        # s_y = np.sin(np.radians(rotation.yaw))
+        # c_p = np.cos(np.radians(rotation.pitch))
+        # s_p = np.sin(np.radians(rotation.pitch))
+        # c_r = np.cos(np.radians(rotation.roll))
+        # s_r = np.sin(np.radians(rotation.roll))
+
+        # matrix = np.identity(4)
+        # matrix[0, 0] = c_p * c_y
+        # matrix[0, 1] = c_y * s_p * s_r - s_y * c_r
+        # matrix[0, 2] = -c_y * s_p * c_r - s_y * s_r
+        # matrix[0, 3] = location.x
+        # matrix[1, 0] = c_p * s_y
+        # matrix[1, 1] = s_y * s_p * s_r + c_y * c_r
+        # matrix[1, 2] = -s_y * s_p * c_r + c_y * s_r
+        # matrix[1, 3] = location.y
+        # matrix[2, 0] = s_p
+        # matrix[2, 1] = -c_p * s_r
+        # matrix[2, 2] = c_p * c_r
+        # matrix[2, 3] = location.z
+
+        rotation = transform.rotation
+        location = transform.location
+        c_y = np.cos(np.radians(rotation.yaw))
+        s_y = np.sin(np.radians(rotation.yaw))
+        c_r = np.cos(np.radians(rotation.roll))
+        s_r = np.sin(np.radians(rotation.roll))
+        c_p = np.cos(np.radians(rotation.pitch))
+        s_p = np.sin(np.radians(rotation.pitch))
+        matrix = np.matrix(np.identity(4))
+        matrix[0, 3] = location.x
+        matrix[1, 3] = location.y
+        matrix[2, 3] = location.z
+        matrix[0, 0] = c_p * c_y
+        matrix[0, 1] = c_y * s_p * s_r - s_y * c_r
+        matrix[0, 2] = -c_y * s_p * c_r - s_y * s_r
+        matrix[1, 0] = s_y * c_p
+        matrix[1, 1] = s_y * s_p * s_r + c_y * c_r
+        matrix[1, 2] = -s_y * s_p * c_r + c_y * s_r
+        matrix[2, 0] = s_p
+        matrix[2, 1] = -c_p * s_r
+        matrix[2, 2] = c_p * c_r
+        return matrix
+
+    def draw_bounding_boxes(self, bounding_boxes):
+        """
+        Draws bounding boxes on pygame display.
+        """
+
+        bb_surface = self.surface # pygame.Surface((VIEW_WIDTH, VIEW_HEIGHT))
+        bb_surface.set_colorkey((0, 0, 0))
+        for bbox in bounding_boxes:
+            points = [(int(bbox[i, 0]), int(bbox[i, 1])) for i in range(8)]
+            # draw lines
+            # base
+            pygame.draw.line(bb_surface, BB_COLOR, points[0], points[1])
+            pygame.draw.line(bb_surface, BB_COLOR, points[0], points[1])
+            pygame.draw.line(bb_surface, BB_COLOR, points[1], points[2])
+            pygame.draw.line(bb_surface, BB_COLOR, points[2], points[3])
+            pygame.draw.line(bb_surface, BB_COLOR, points[3], points[0])
+            # top
+            pygame.draw.line(bb_surface, BB_COLOR, points[4], points[5])
+            pygame.draw.line(bb_surface, BB_COLOR, points[5], points[6])
+            pygame.draw.line(bb_surface, BB_COLOR, points[6], points[7])
+            pygame.draw.line(bb_surface, BB_COLOR, points[7], points[4])
+            # base-top
+            pygame.draw.line(bb_surface, BB_COLOR, points[0], points[4])
+            pygame.draw.line(bb_surface, BB_COLOR, points[1], points[5])
+            pygame.draw.line(bb_surface, BB_COLOR, points[2], points[6])
+            pygame.draw.line(bb_surface, BB_COLOR, points[3], points[7])
+        # display.blit(bb_surface, (0, 0))
+
+    @staticmethod
+    def get_bounding_box(self, vehicle, camera):
+        """
+        Returns 3D bounding box for a vehicle based on camera view.
+        """
+
+        bb_cords = self._create_bb_points(vehicle)
+        cords_x_y_z = self._vehicle_to_sensor(self, bb_cords, vehicle, camera)[:3, :]
+        cords_y_minus_z_x = np.concatenate([cords_x_y_z[1, :], -cords_x_y_z[2, :], cords_x_y_z[0, :]])
+        bbox = np.transpose(np.dot(camera.calibration, cords_y_minus_z_x))
+        camera_bbox = np.concatenate([bbox[:, 0] / bbox[:, 2], bbox[:, 1] / bbox[:, 2], bbox[:, 2]], axis=1)
+        return camera_bbox
+
+    @staticmethod
+    def _create_bb_points(vehicle):
+        """
+        Returns 3D bounding box for a vehicle.
+        """
+
+        cords = np.zeros((8, 4))
+        extent = vehicle.bounding_box.extent
+        cords[0, :] = np.array([extent.x, extent.y, -extent.z, 1])
+        cords[1, :] = np.array([-extent.x, extent.y, -extent.z, 1])
+        cords[2, :] = np.array([-extent.x, -extent.y, -extent.z, 1])
+        cords[3, :] = np.array([extent.x, -extent.y, -extent.z, 1])
+        cords[4, :] = np.array([extent.x, extent.y, extent.z, 1])
+        cords[5, :] = np.array([-extent.x, extent.y, extent.z, 1])
+        cords[6, :] = np.array([-extent.x, -extent.y, extent.z, 1])
+        cords[7, :] = np.array([extent.x, -extent.y, extent.z, 1])
+        return cords
+
+    @staticmethod
+    def _vehicle_to_sensor(self, cords, vehicle, sensor):
+        """
+        Transforms coordinates of a vehicle bounding box to sensor.
+        """
+
+        world_cord = self._vehicle_to_world(self, cords, vehicle)
+        sensor_cord = self._world_to_sensor(self, world_cord, sensor)
+        return sensor_cord
+
+    @staticmethod
+    def _vehicle_to_world(self, cords, vehicle):
+        """
+        Transforms coordinates of a vehicle bounding box to world.
+        """
+
+        bb_transform = carla.Transform(vehicle.bounding_box.location)
+        bb_vehicle_matrix = self.get_matrix(bb_transform)
+        vehicle_world_matrix = self.get_matrix(vehicle.get_transform())
+        bb_world_matrix = np.dot(vehicle_world_matrix, bb_vehicle_matrix)
+        world_cords = np.dot(bb_world_matrix, np.transpose(cords))
+        return world_cords
+
+    @staticmethod
+    def _world_to_sensor(self, cords, sensor):
+        """
+        Transforms world coordinates to sensor.
+        """
+
+        sensor_world_matrix = self.get_matrix(sensor.get_transform())
+        world_sensor_matrix = np.linalg.inv(sensor_world_matrix)
+        sensor_cords = np.dot(world_sensor_matrix, cords)
+        return sensor_cords
+
+    @staticmethod
+    def get_matrix(transform):
+        """
+        Creates matrix from carla transform.
+        """
+
+        rotation = transform.rotation
+        location = transform.location
+        c_y = np.cos(np.radians(rotation.yaw))
+        s_y = np.sin(np.radians(rotation.yaw))
+        c_r = np.cos(np.radians(rotation.roll))
+        s_r = np.sin(np.radians(rotation.roll))
+        c_p = np.cos(np.radians(rotation.pitch))
+        s_p = np.sin(np.radians(rotation.pitch))
+        matrix = np.matrix(np.identity(4))
+        matrix[0, 3] = location.x
+        matrix[1, 3] = location.y
+        matrix[2, 3] = location.z
+        matrix[0, 0] = c_p * c_y
+        matrix[0, 1] = c_y * s_p * s_r - s_y * c_r
+        matrix[0, 2] = -c_y * s_p * c_r - s_y * s_r
+        matrix[1, 0] = s_y * c_p
+        matrix[1, 1] = s_y * s_p * s_r + c_y * c_r
+        matrix[1, 2] = -s_y * s_p * c_r + c_y * s_r
+        matrix[2, 0] = s_p
+        matrix[2, 1] = -c_p * s_r
+        matrix[2, 2] = c_p * c_r
+        return matrix
+
+
+    def get_camera_intrinsic(self, width, height, fov=90.0):
+        """
+        生成相機內部參數矩陣
+        """
+        f_x = width / (2.0 * np.tan(fov * np.pi / 360.0))
+        f_y = f_x  # 假設 pixel aspect ratio 為1
+        c_x = width / 2.0
+        c_y = height / 2.0
+
+        K = np.array([
+            [f_x,   0, c_x],
+            [0,   f_y, c_y],
+            [0,     0,   1]
+        ])
+        return K
 
     def get_attribute_value(self, attr):
         if str(attr.type) == "Int":
@@ -1414,7 +1794,7 @@ class CameraManager(object):
 
     def get_camera_params(self, cam_para_path="camera_params.txt", kitti_path="calib.txt"):
         # global save_path
-        save_dir = '/home/rvl/UnrealEngine_4.26/Engine/Binaries/Linux/carla/PythonAPI/examples/Recording/'
+        save_dir = '/mnt/data1/rvl/UnrealEngine_4.26/Engine/Binaries/Linux/carla/PythonAPI/examples/Recording/'
         save_path = save_dir + cam_para_path
         kitti_path = save_dir + kitti_path
         # 取得目前 transform 和 blueprint
@@ -1471,6 +1851,197 @@ class CameraManager(object):
                 f.write("R0_rect: " + " ".join(["1.0000" if i % 4 == 0 else "0.0000" for i in range(9)]) + "\n")
 
             print(f"📄 KITTI 格式參數已完整儲存到 {kitti_path}")
+
+    @staticmethod
+    def get_bottom_center_2d(self, vehicle, camera):
+        """
+        回傳 3D bounding box 底部中心點在影像中的投影座標 (x, y)
+        """
+        # 建立 3D bounding box 的 8 個角點
+        bb_cords = self._create_bb_points(vehicle)
+
+        # 計算底部四個點的平均，即底部中心點 (車體座標)
+        bottom_center = np.mean(bb_cords[0:4, :], axis=0).reshape((4, 1))  # shape = (4, 1)
+
+        # 轉換到底座點的感測器座標 (3x1)
+        cords = self._vehicle_to_sensor(bottom_center.T, vehicle, camera)[:3, :]
+
+        # 換軸順序符合內參矩陣：Y, -Z, X（shape = (3, 1)）
+        cords_yzx = np.array([
+            cords[1][0],         # y
+            -cords[2][0],        # -z
+            cords[0][0]          # x
+        ]).reshape(3, 1)         # shape = (3,1)
+
+        # 使用相機內參做投影 (3x3) x (3x1) = (3x1)
+        projected = np.dot(camera.calibration, cords_yzx)
+
+        # 正規化為像素座標
+        x = int(projected[0][0] / projected[2][0])
+        y = int(projected[1][0] / projected[2][0])
+
+        return [x, y]
+
+    @staticmethod
+    def get_simple_kitti_label(self, vehicle, camera):
+        """
+        生成一個簡化的KITTI格式標籤，直接使用CARLA的函數
+
+        Args:
+            vehicle: CARLA車輛對象
+            camera: CARLA相機對象
+
+        Returns:
+            kitti_label: KITTI格式的標籤字符串
+        """
+        # 獲取車輛的邊界框和變換
+        bb = vehicle.bounding_box
+        vehicle_transform = vehicle.get_transform()
+        camera_transform = camera.get_transform()
+
+        # 獲取車輛的類別
+        vehicle_type = vehicle.type_id.split('.')[-2]
+        obj_type = 'Car'
+        if 'bicycle' in vehicle_type:
+            obj_type = 'Cyclist'
+        elif 'motorcycle' in vehicle_type:
+            obj_type = 'Cyclist'
+        elif 'pedestrian' in vehicle_type:
+            obj_type = 'Pedestrian'        
+        kitti_label = f"{obj_type} "
+
+        # 遮擋
+        truncated = 0
+        occluded = 0
+        alpha = 0
+        kitti_label += f"{truncated} {occluded} {alpha} "
+
+        # 2d bounding box 左上 ＆ 右下
+        kitti_label += f"{0} {0} {0} {0} "
+        
+        # 車輛尺寸 單位公尺
+        height = bb.extent.z * 2  # 高度
+        width = bb.extent.y * 2   # 寬度
+        length = bb.extent.x * 2  # 長度
+        kitti_label += f"{height:.2f} {width:.2f} {length:.2f} "
+
+        # 3d bbox 的部份改為八個點位置，以像素為單位
+        """ 
+        bbox_3d = ClientSideBoundingBoxes.get_bounding_box(vehicle, camera)
+        points = [(int(bbox_3d[i, 0]), int(bbox_3d[i, 1])) for i in range(8)]
+
+        # 添加3D邊界框的8個投影點
+        for j in range(8):
+            kitti_label += f"{points[j]}"
+        kitti_label += " "        
+        """ 
+        
+        # 獲取車輛中心點在車輛坐標系中的位置（通常是(0,0,0)）
+        vehicle_center = np.array([0, 0, 0, 1]).reshape(4, 1)
+        # 將車輛中心從車輛坐標系轉到相機坐標系        
+        # ---車輛到世界坐標系的變換矩陣
+        vehicle_to_world = self.get_matrix(vehicle_transform)
+        vehicle_center_world = np.dot(vehicle_to_world, vehicle_center)
+        # ---世界到相機的變換矩陣
+        world_to_camera = np.linalg.inv(self.get_matrix(camera_transform))                
+        vehicle_center_camera = np.dot(world_to_camera, vehicle_center_world)
+
+        # 提取x, y, z（注意：CARLA和KITTI的座標系有所不同，需要轉換），單位為 meter
+        # CARLA: X(前), Y(右), Z(上)
+        # KITTI相機坐標系: X(右), Y(下), Z(前)
+        tx = vehicle_center_camera[1][0]  # CARLA Y -> KITTI X
+        ty = -vehicle_center_camera[2][0]  # 負的CARLA Z -> KITTI Y
+        tz = vehicle_center_camera[0][0]  # CARLA X -> KITTI Z
+        
+        # 檢查物體是否在相機前方
+        if tz <= 0:
+            print(f"[{vehicle.id}] 物體在相機後方: tz={tz}")
+            return None        
+        # 添加相機座標
+        kitti_label += f"{tx:.5f} {ty:.5f} {tz:.5f} "
+
+        ''' 05/31
+        # 計算車輛在相機坐標系中的 rotation_y
+        # KITTI rotation_y 定義：物體相對於相機坐標系 Y 軸的旋轉角度
+        # 範圍：[-π, π]，正值表示逆時針旋轉
+
+        # 方法1：使用車輛的旋轉矩陣計算
+        vehicle_rotation = vehicle_transform.rotation
+        vehicle_yaw_world = np.radians(vehicle_rotation.yaw)  # 轉換為弧度
+
+        # 獲取相機的旋轉
+        camera_rotation = camera_transform.rotation
+        camera_yaw_world = np.radians(camera_rotation.yaw)
+
+        # 計算車輛相對於相機的 yaw 角度（在世界坐標系中）
+        relative_yaw = vehicle_yaw_world - camera_yaw_world
+
+        # 將角度標準化到 [-π, π] 範圍
+        relative_yaw = ((relative_yaw + np.pi) % (2 * np.pi)) - np.pi
+
+        # 由於 CARLA 和 KITTI 坐標系的差異，需要進行轉換
+        # CARLA: yaw 是繞 Z 軸的旋轉
+        # KITTI: rotation_y 是繞 Y 軸的旋轉，且坐標系已轉換
+        # 考慮坐標系轉換：CARLA Z軸朝上，KITTI Y軸朝下
+        rotation_y = -relative_yaw + np.pi/2
+
+        # 標準化到 [-π, π] 範圍
+        rotation_y = ((rotation_y + np.pi) % (2 * np.pi)) - np.pi
+        kitti_label += f"{rotation_y:.5f} "
+        '''
+        # 方法2：更精確的向量計算方法（推薦使用）
+        # 獲取車輛前向向量並轉換到相機坐標系
+        vehicle_forward = vehicle_transform.get_forward_vector()
+        vehicle_forward_world = np.array([vehicle_forward.x, vehicle_forward.y, vehicle_forward.z, 0])
+
+        # 轉換到相機坐標系
+        vehicle_forward_camera = np.dot(world_to_camera, vehicle_forward_world)
+
+        # 應用 CARLA 到 KITTI 的坐標系轉換
+        # CARLA: X(前), Y(右), Z(上) -> KITTI: X(右), Y(下), Z(前)
+        forward_x_kitti = vehicle_forward_camera[1]  # CARLA Y -> KITTI X
+        forward_z_kitti = vehicle_forward_camera[0]  # CARLA X -> KITTI Z
+
+        # 修正：KITTI rotation_y 的定義
+        # KITTI 中 rotation_y = 0 表示物體朝向 +Z 方向（相機前方）
+        # 但車輛的"前方"在 KITTI 中通常是車頭朝向，需要修正 90 度偏差
+        # 這是因為 CARLA 車輛模型和 KITTI 標註約定的差異
+
+        # 計算在 KITTI 相機坐標系中的 rotation_y
+        if abs(forward_z_kitti) < 1e-6:
+            # 當 Z 分量接近 0 時，物體朝向與相機光軸垂直
+            rotation_y = np.pi/2 if forward_x_kitti > 0 else -np.pi/2
+        else:
+            # 使用 atan2 計算角度
+            rotation_y = np.arctan2(forward_x_kitti, forward_z_kitti)
+
+        # 修正 90 度偏差 - 這是關鍵修正
+        # 減去 π/2 來校正 CARLA 車輛模型與 KITTI 標註約定的差異
+        rotation_y = rotation_y - np.pi/2
+
+        # 標準化角度到 [-π, π] 範圍
+        rotation_y = ((rotation_y + np.pi) % (2 * np.pi)) - np.pi
+        kitti_label += f"{rotation_y:.5f} "
+
+        # 中心點位置 image pixel
+        center_2d = self.get_bottom_center_2d(self, vehicle, camera)
+        print("影像中底部中心點位置:", center_2d)
+        #kitti_label += f"{center_2d[0]} {center_2d[1]}"
+        
+        """ 
+        # 輸出相機矩陣
+        camera_bp = self.world.get_blueprint_library().find('sensor.camera.rgb')
+        camera_transform = carla.Transform(carla.Location(x=1.5, z=2.4))
+        image_width = 960
+        image_height = 540 
+        P2 = BasicSynchronousClient.get_kitti_p2_matrix(camera_bp, camera_transform, image_width, image_height)
+        # print(P2)
+        """ 
+
+        # txt 輸出： 類別、長、寬、高、x、y、z、旋轉角度、3D_bbox 底部中心點座標
+        return kitti_label
+
+
 
 # ==============================================================================
 # -- game_loop() ---------------------------------------------------------------

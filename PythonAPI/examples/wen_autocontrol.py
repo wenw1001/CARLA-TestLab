@@ -81,7 +81,7 @@ def load_path(filename=None):
 
     return waypoints
 
-def replay_path(vehicle, waypoints):
+def replay_path(vehicle, waypoints, sleep):
     """ 讓車輛沿著記錄的路徑行駛 (包含方向角 yaw) """
     vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.0, hand_brake=True))
     # print("---- pressed R ---- \nstart recording ) ")
@@ -89,7 +89,7 @@ def replay_path(vehicle, waypoints):
     for waypoint in waypoints:
         vehicle.set_transform(waypoint)  # 直接使用 Transform 
         print(f"location: {waypoint}")
-        time.sleep(1.5)  # 每 1.5 秒移動一次
+        time.sleep(sleep)  
     print("Path replay complete!")
     # print("---- pressed R ----")
     # keyboard.write('R',delay=0)
@@ -147,7 +147,8 @@ def main(args):
         waypoints = load_path(map_path)
 
         # 讓車輛重現行駛路徑
-        replay_path(ego_vehicle, waypoints)
+        args.sleep
+        replay_path(ego_vehicle, waypoints, args.sleep)
 
         print(f"Path:{map_path} completed!")
 
@@ -165,14 +166,19 @@ if __name__ == '__main__':
         default=True,
         help='replay and move vehicle')
     argparser.add_argument(
+    '--sleep',
+    type=int,
+    default=10,  # 每 20 秒移動一次
+    help='sleep time')
+    argparser.add_argument(
     '--recordingPath',
     type=str,
-    default='Recording/recorded_path_all5.csv',  # 可以自己設一個預設儲存路徑
+    default='Recording/recorded_path_all6.csv',  # 預計儲存路徑，可以自己設一個預設儲存路徑
     help='path to save recording path')
     argparser.add_argument(
     '--replayPath',
     type=str,
-    default='Recording/recorded_path_all2.csv',  # 可以自己設一個預設儲存路徑
+    default='Recording/recorded_path_all4.csv',  # 重播路徑，可以自己設一個預設儲存路徑
     help='path to load replay path')
 
     args = argparser.parse_args()

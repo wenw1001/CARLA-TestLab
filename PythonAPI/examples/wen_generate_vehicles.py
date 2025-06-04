@@ -438,9 +438,9 @@ def main():
         blueprint_list = ["tesla.cybertruck","ford.mustang", "volkswagen.t2", "ford.crown","mercedes.coupe","audi.a2",
                           "nissan.micra", "tesla.model3","nissan.patrol", "jeep.wrangler_rubicon", "dodge.charger_2020",
                             "audi.etron", "mini.cooper_s_2021", ]
-        blueprints = get_actor_blueprints(world, args.filterv, args.generationv)
-        if not blueprints:
-            raise ValueError("Couldn't find any vehicles with the specified filters")
+        
+        # if not blueprints:
+        #     raise ValueError("Couldn't find any vehicles with the specified filters")
         
         # blueprint = blueprints[0]
         actor_list = world.get_actors()
@@ -467,7 +467,9 @@ def main():
                 # transform = carla.Transform(carla.Location(x=x, y=y, z=z), carla.Rotation(yaw=0))
                 filterv = random.choice(blueprint_list)
                 # print(f"filterv: {filterv}")
-                blueprints = get_actor_blueprints(world, "vehicle."+filterv, args.generationv) # fix blueprints
+                # blueprints = get_actor_blueprints(world, "vehicle."+filterv, args.generationv) # fix blueprints
+                blueprints = get_actor_blueprints(world, args.filterv, args.generationv)
+                blueprints = [x for x in blueprints if x.get_attribute('base_type') == 'car']
                 blueprint = random.choice(blueprints)
                 vehicle_actor = world.try_spawn_actor(blueprint, location)
                 while vehicle_actor is None:

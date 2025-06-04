@@ -228,7 +228,7 @@ def main():
                             nearby_vehicles.append((vehicle, distance))
 
                 if nearby_vehicles:
-                    print(f"偵測到前方 {len(nearby_vehicles)} 輛停車車輛在 50 公尺內：")
+                    print(f"偵測到前方 {len(nearby_vehicles)} 輛停車車輛在 100 公尺內：")
                     for vehicle, distance in nearby_vehicles:
                         loc = vehicle.get_location()
                         print(f"  - 車輛 {vehicle.id} 位置: ({loc.x:.2f}, {loc.y:.2f}, {loc.z:.2f}), 距離: {distance:.4f} m")
